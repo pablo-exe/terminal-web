@@ -332,6 +332,7 @@ const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 // DOM
 // ---------------------------------------------------------------------------
 const root = document.documentElement;
+root.classList.toggle('android', isAndroid);
 const topbar = document.getElementById('topbar') as HTMLElement;
 const termArea = document.getElementById('terminal') as HTMLElement;
 const keybarEl = document.getElementById('keybar') as HTMLElement;
@@ -584,6 +585,23 @@ class Session {
     this.wireInput();
     this.wireTouchScroll();
     this.wireHandles();
+    if (isAndroid) {
+      // Output can move the cursor after the keyboard has opened. Recalculate
+      // the minimum pan after rendering, without resizing the terminal grid.
+      this.term.onRender(() => {
+        if (isActive(this)) scheduleKeyboardLayout();
+      });
+    }
+  }
+
+  /** Cursor's bottom edge relative to the full terminal area, including splits. */
+  cursorBottomPx(): number {
+    const screen = this.term.element?.querySelector('.xterm-screen');
+    if (!screen || this.term.rows < 1) return 0;
+    const rect = screen.getBoundingClientRect();
+    const buffer = this.term.buffer.active;
+    const row = Math.max(0, Math.min(this.term.rows - 1, buffer.baseY + buffer.cursorY - buffer.viewportY));
+    return rect.top - termArea.getBoundingClientRect().top + (row + 1) * rect.height / this.term.rows + 4;
   }
 
   /**
@@ -1578,6 +1596,7 @@ function focusPane(s: Session): void {
   activeSession = s;
   markFocusedPane();
   reflectActiveStatus();
+  if (isAndroid) scheduleKeyboardLayout();
 }
 
 /** Say which half has the keys, but only while there are two to tell apart. */
@@ -1799,6 +1818,7 @@ function activateSession(s: Session): void {
   refreshMobileUI();
   refreshLayoutUI();
   saveTabs();
+  if (isAndroid) scheduleKeyboardLayout();
 }
 
 // Ask before killing a session: closing a tab terminates its tmux session and
@@ -2447,7 +2467,67 @@ const KEYBOARD_MIN_VISIBLE_PX = 72;
 // only the framing page can see it, and it says so by postMessage.
 let framedCovered = 0;
 
+let keyboardLayoutFrame: number | null = null;
+function scheduleKeyboardLayout(): void {
+  if (keyboardLayoutFrame !== null) return;
+  keyboardLayoutFrame = requestAnimationFrame(() => {
+    keyboardLayoutFrame = null;
+    updateKeyboardOffset();
+  });
+}
+
+let androidRestingViewportH: number | null = null;
+let androidLayoutWidth = 0;
+
+function updateAndroidKeyboardLayout(): void {
+  const vv = window.visualViewport;
+  // Pinch zoom is not keyboard occlusion; retain the existing terminal grid.
+  if (vv && Math.abs(vv.scale - 1) > 0.01) return;
+  // Fixed-position bottom uses the layout viewport, which may differ from
+  // innerHeight while Chrome changes its browser chrome or keyboard policy.
+  const layoutH = document.documentElement.clientHeight;
+  const viewportTop = Math.max(0, vv?.offsetTop ?? 0);
+  const bottom = Math.max(viewportTop, Math.min(layoutH, viewportTop + (vv?.height ?? layoutH), layoutH - framedCovered));
+  const visibleH = bottom - viewportTop;
+  const width = document.documentElement.clientWidth;
+  const rotated = androidLayoutWidth !== width;
+  androidLayoutWidth = width;
+  const el = document.activeElement;
+  const typing = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement;
+  const wasOpen = root.classList.contains('keyboard-open');
+  if (androidRestingViewportH === null || rotated || visibleH > androidRestingViewportH || (!typing && !wasOpen)) {
+    androidRestingViewportH = visibleH;
+  }
+  const keyboardOpen = androidRestingViewportH - visibleH > KEYBOARD_MIN_PX || (rotated && wasOpen && typing);
+  root.classList.toggle('keyboard-open', keyboardOpen);
+  root.style.setProperty('--viewport-top', `${viewportTop}px`);
+  root.style.setProperty('--kb-gap', `${Math.round(layoutH - bottom)}px`);
+  // Read after toggling keyboard-open: the keyboard already includes Android's
+  // navigation area, so the extra safe-area padding has just been removed.
+  const keybarH = keybarEl.classList.contains('hidden') ? 0 : keybarEl.offsetHeight;
+  root.style.setProperty('--keybar-h', `${keybarH}px`);
+  const headerH = cssPx(termArea, 'top') - viewportTop;
+  const available = Math.max(0, visibleH - headerH - keybarH);
+  if (restingTermH === null || !keyboardOpen || rotated) restingTermH = available;
+  root.style.setProperty('--term-h', `${Math.round(restingTermH)}px`);
+  // A new shell's prompt is at the top, not the last row. Pan only far enough
+  // to expose the cursor; moving the whole keyboard height hides that prompt.
+  const needed = Math.max(0, (activeSession?.cursorBottomPx() ?? 0) - available);
+  const room = Math.max(0, restingTermH - KEYBOARD_MIN_VISIBLE_PX);
+  const offset = keyboardOpen ? Math.min(Math.ceil(needed), room) : 0;
+  root.style.setProperty('--kb-offset', `${offset}px`);
+  if (VV_DEBUG) {
+    activeSession?.debugSend('vv', `android=1 layout=${layoutH} vvh=${Math.round(visibleH)} vvTop=${viewportTop} ` +
+      `gap=${Math.round(layoutH - bottom)} keybar=${keybarH} avail=${Math.round(available)} ` +
+      `resting=${Math.round(restingTermH)} off=${offset} keyboard=${keyboardOpen ? 1 : 0}`);
+  }
+}
+
 function updateKeyboardOffset(): void {
+  if (isAndroid) {
+    updateAndroidKeyboardLayout();
+    return;
+  }
   const top = cssPx(termArea, 'top');
   const keybarH = cssPx(root, '--keybar-h');
   // Everything hidden below what can be seen, however we came to know about it:
@@ -3164,6 +3244,9 @@ let areaObserver: ResizeObserver | null = null;
 if (typeof ResizeObserver !== 'undefined') {
   areaObserver = new ResizeObserver(() => fitActive());
   areaObserver.observe(termArea);
+  // Wrapping and safe-area changes can alter the bar without a window resize.
+  const keybarObserver = new ResizeObserver(() => updateKeybarHeight());
+  keybarObserver.observe(keybarEl);
 }
 // Embedded: the framing page is the only one that can see the keyboard, so it
 // tells us. Nothing else here can, and a wrong guess is worse than none.

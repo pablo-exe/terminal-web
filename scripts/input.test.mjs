@@ -40,18 +40,30 @@ after(async () => {
   if (server) await new Promise((done) => server.close(done));
 });
 
-async function fixture(t, userAgent = android) {
+async function fixture(t, userAgent = android, metrics = null) {
   const context = await browser.newContext({ userAgent, viewport: { width: 412, height: 915 }, hasTouch: true });
   t.after(() => context.close());
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   t.after(() => assert.deepEqual(errors, []));
-  await page.addInitScript(() => {
+  await page.addInitScript((metrics) => {
+    if (metrics) {
+      window.viewportFixture = { height: 915, offsetTop: 0, scale: 1, innerHeight: null, ...metrics };
+      const viewport = new EventTarget();
+      for (const key of ['height', 'offsetTop', 'scale']) {
+        Object.defineProperty(viewport, key, { get: () => window.viewportFixture[key] });
+      }
+      Object.defineProperty(window, 'visualViewport', { value: viewport });
+      Object.defineProperty(window, 'innerHeight', {
+        get: () => window.viewportFixture.innerHeight ?? document.documentElement.clientHeight,
+      });
+    }
     Object.defineProperty(navigator, 'platform', {
       get: () => /iPhone/.test(navigator.userAgent) ? 'iPhone' : 'Linux aarch64',
     });
     window.terminalBytes = [];
+    window.terminalResizes = [];
     window.fixtureSockets = [];
     window.WebSocket = class {
       static OPEN = 1;
@@ -64,10 +76,11 @@ async function fixture(t, userAgent = android) {
       }
       send(data) {
         if (typeof data !== 'string') window.terminalBytes.push(new TextDecoder().decode(data));
+        else if (JSON.parse(data).type === 'resize') window.terminalResizes.push(JSON.parse(data));
       }
       close() { this.readyState = 3; this.onclose?.({}); }
     };
-  });
+  }, metrics);
   await page.goto(base + '/?webgl=0');
   await page.waitForFunction(() => window.fixtureSockets[0]?.readyState === 1);
   await page.locator('.xterm-helper-textarea').focus();
@@ -200,4 +213,104 @@ test('desktop: ordinary typing and Ctrl+C retain their native terminal behavior'
   await page.keyboard.type('echo desktop');
   await page.keyboard.press('Control+c');
   assert.equal(await sent(page), 'echo desktop\x03');
+});
+
+
+// Model the two browser keyboard policies and viewport panning explicitly.
+// Headless Chromium has no OS keyboard, so these are geometry regressions.
+async function viewport(page, height, offsetTop = 0) {
+  await page.evaluate(({ height, offsetTop }) => {
+    Object.assign(window.viewportFixture, { height, offsetTop });
+    window.visualViewport.dispatchEvent(new Event('resize'));
+    window.visualViewport.dispatchEvent(new Event('scroll'));
+  }, { height, offsetTop });
+  await page.waitForTimeout(80);
+}
+async function output(page, text) {
+  await page.evaluate((text) => window.fixtureSockets[0].onmessage({
+    data: new TextEncoder().encode(text).buffer,
+  }), text);
+  await page.waitForTimeout(80);
+}
+async function geometry(page) {
+  return page.evaluate(() => {
+    const keybar = document.getElementById('keybar').getBoundingClientRect();
+    const screen = document.querySelector('.xterm-screen').getBoundingClientRect();
+    const cursor = document.querySelector('.xterm-cursor').getBoundingClientRect();
+    const header = document.getElementById('mobilebar').getBoundingClientRect();
+    return {
+      keybarTop: keybar.top, keybarBottom: keybar.bottom,
+      screenHeight: screen.height, cursorTop: cursor.top, cursorBottom: cursor.bottom,
+      headerBottom: header.bottom, pan: parseFloat(document.documentElement.style.getPropertyValue('--kb-offset')),
+      rows: window.terminalResizes.at(-1)?.rows,
+    };
+  });
+}
+
+test('Android viewport: fresh prompt stays visible when only the visual viewport shrinks', async (t) => {
+  const page = await fixture(t, android, {});
+  await output(page, '\x1b[2J\x1b[H$ ');
+  const before = await geometry(page);
+  await viewport(page, 560);
+  const after = await geometry(page);
+  assert.ok(Math.abs(after.keybarBottom - 560) < 1, JSON.stringify(after));
+  assert.equal(after.pan, 0, 'do not slide a fresh prompt off the top');
+  assert.ok(after.cursorTop >= after.headerBottom && after.cursorBottom < after.keybarTop, JSON.stringify(after));
+  assert.equal(after.screenHeight, before.screenHeight);
+  assert.equal(after.rows, before.rows);
+  await viewport(page, 915);
+  assert.equal((await geometry(page)).pan, 0);
+});
+
+test('Android viewport: fixed keybar uses layout height, not a larger innerHeight', async (t) => {
+  const page = await fixture(t, android, { innerHeight: 975 });
+  await output(page, '\x1b[H$ ');
+  await viewport(page, 560);
+  const after = await geometry(page);
+  assert.ok(Math.abs(after.keybarBottom - 560) < 1, JSON.stringify(after));
+});
+
+test('Android viewport: bottom prompt is visible across pan, output and content resize', async (t) => {
+  const page = await fixture(t, android, {});
+  await output(page, '\x1b[999;1H$ ');
+  const before = await geometry(page);
+  await viewport(page, 440, 120);
+  let after = await geometry(page);
+  assert.ok(Math.abs(after.keybarBottom - 560) < 1, JSON.stringify(after));
+  assert.ok(after.cursorTop >= after.headerBottom && after.cursorBottom <= after.keybarTop, JSON.stringify(after));
+  assert.ok(after.pan > 0);
+  assert.equal(after.rows, before.rows);
+  // The shell moves back to its first row while the keyboard remains open.
+  await output(page, '\x1b[H$ ');
+  after = await geometry(page);
+  assert.equal(after.pan, 0);
+  assert.ok(after.cursorTop >= after.headerBottom, JSON.stringify(after));
+  // Android Chrome's resizes-content policy also shrinks the fixed-position box.
+  await page.setViewportSize({ width: 412, height: 560 });
+  await viewport(page, 560);
+  after = await geometry(page);
+  assert.ok(Math.abs(after.keybarBottom - 560) < 1, JSON.stringify(after));
+  assert.equal(after.rows, before.rows);
+  await page.setViewportSize({ width: 412, height: 915 });
+  await viewport(page, 915);
+  assert.equal((await geometry(page)).rows, before.rows);
+});
+
+test('Android viewport: navigation safe area is not added beneath the keyboard', async (t) => {
+  const page = await fixture(t, android, {});
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 24 } });
+  await page.waitForTimeout(100);
+  await output(page, '\x1b[H$ ');
+  const before = await geometry(page);
+  await viewport(page, 560);
+  const after = await geometry(page);
+  const padding = await page.locator('#keybar').evaluate((el) => parseFloat(getComputedStyle(el).paddingBottom));
+  assert.equal(padding, 6);
+  assert.ok(Math.abs(after.keybarBottom - 560) < 1);
+  assert.equal(after.rows, before.rows);
+  await viewport(page, 915);
+  await page.waitForTimeout(80);
+  assert.equal(await page.locator('#keybar').evaluate((el) => parseFloat(getComputedStyle(el).paddingBottom)), 30);
+  assert.equal((await geometry(page)).rows, before.rows);
 });

@@ -218,7 +218,13 @@ These checks load the real frontend and xterm.js in headless Chromium with
 fixture HTTP responses and a recording WebSocket. They do not start the server,
 a shell, or tmux. They cover Android's keyCode 229 + input events, predictive
 composition, repeated Unicode input, paste, Backspace, reconnection during
-composition, and the custom iOS and desktop input paths.
+composition, and the custom iOS and desktop input paths. Android viewport checks
+also cover a fresh prompt, a cursor near the bottom, browser viewport panning,
+layout/visual viewport differences, and navigation safe-area padding through
+Chromium emulation. Opening the keyboard keeps the terminal grid stable, pans
+only enough to expose the cursor, and places the on-screen keys at the visible
+viewport edge. Chromium uses `interactive-widget=resizes-content`; the layout
+also handles browsers that resize only the visual viewport.
 
 The events and device identities are simulated; this does not replace a check
 on a physical Android device with Gboard or on Safari. On a minimal Linux
