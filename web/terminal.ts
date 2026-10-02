@@ -90,6 +90,8 @@ const MAX_PENDING_SEQ = 64 * 1024;
 // terminal's ^C/^V — hence the OS-specific copy/paste key handling below.
 const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
 const isAndroid = /Android/i.test(navigator.userAgent);
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
@@ -585,7 +587,7 @@ class Session {
     this.wireInput();
     this.wireTouchScroll();
     this.wireHandles();
-    if (isAndroid) {
+    if (isAndroid || isIOS) {
       // Output can move the cursor after the keyboard has opened. Recalculate
       // the minimum pan after rendering, without resizing the terminal grid.
       this.term.onRender(() => {
@@ -924,7 +926,7 @@ class Session {
           this.lastData = text;
           this.lastDataAt = performance.now();
           this.debug('composition-commit', text);
-          this.send(text);
+          this.sendTyped(text);
         } else {
           // Cancelled composition (Escape): nothing to send, but still reset
           // the buffer — after xterm's deferred slice has run, not racing it.
@@ -962,7 +964,7 @@ class Session {
           if (!pendingKeys.has(s)) return; // a composition consumed it
           pendingKeys.delete(s);
           this.debug('forward-key', k);
-          this.send(k);
+          this.sendTyped(k);
         }, 90);
       });
     }
@@ -970,7 +972,7 @@ class Session {
     this.term.onData((data: string) => {
       this.debug('onData', data);
       if (isAndroid) {
-        this.send(data);
+        this.sendTyped(data);
         return;
       }
       const now = performance.now();
@@ -1008,8 +1010,24 @@ class Session {
       }
       this.lastData = data;
       this.lastDataAt = now;
-      this.send(data);
+      this.sendTyped(data);
     });
+  }
+
+  private sendTyped(data: string): void {
+    if (shiftArmed && /^[a-z]$/i.test(data)) {
+      data = data.toUpperCase();
+      shiftArmed = false;
+      refreshModVisuals();
+    }
+    this.send(data);
+  }
+
+  /** Repeated keys are never queued during a disconnected socket. */
+  repeatSeq(seq: string): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    this.send(seq);
+    return true;
   }
 
   private send(data: string): void {
@@ -1596,7 +1614,7 @@ function focusPane(s: Session): void {
   activeSession = s;
   markFocusedPane();
   reflectActiveStatus();
-  if (isAndroid) scheduleKeyboardLayout();
+  if (isAndroid || isIOS) scheduleKeyboardLayout();
 }
 
 /** Say which half has the keys, but only while there are two to tell apart. */
@@ -1818,7 +1836,7 @@ function activateSession(s: Session): void {
   refreshMobileUI();
   refreshLayoutUI();
   saveTabs();
-  if (isAndroid) scheduleKeyboardLayout();
+  if (isAndroid || isIOS) scheduleKeyboardLayout();
 }
 
 // Ask before killing a session: closing a tab terminates its tmux session and
@@ -2528,6 +2546,14 @@ function updateKeyboardOffset(): void {
     updateAndroidKeyboardLayout();
     return;
   }
+  // Safari can pan its visual viewport to focus xterm's hidden textarea.
+  // Keep the header and terminal origin inside that viewport before deciding
+  // how much of the cursor is covered; the key bar retains its existing anchor.
+  if (isIOS) {
+    const vv = window.visualViewport;
+    if (vv && Math.abs(vv.scale - 1) > 0.01) return;
+    root.style.setProperty('--viewport-top', `${Math.max(0, vv?.offsetTop ?? 0)}px`);
+  }
   const top = cssPx(termArea, 'top');
   const keybarH = cssPx(root, '--keybar-h');
   // Everything hidden below what can be seen, however we came to know about it:
@@ -2558,7 +2584,10 @@ function updateKeyboardOffset(): void {
 
   const covered = restingTermH - available;
   const room = Math.max(0, restingTermH - KEYBOARD_MIN_VISIBLE_PX);
-  const offset = covered > KEYBOARD_MIN_PX ? Math.min(Math.round(covered), room) : 0;
+  const needed = isIOS
+    ? Math.max(0, (activeSession?.cursorBottomPx() ?? 0) - available)
+    : covered;
+  const offset = covered > KEYBOARD_MIN_PX ? Math.min(Math.ceil(needed), room) : 0;
   root.style.setProperty('--kb-offset', `${offset}px`);
 
   if (VV_DEBUG) {
@@ -2798,7 +2827,7 @@ document.body.append(selBar);
 interface KeyDef {
   label?: string;
   seq?: string;
-  mod?: 'ctrl' | 'alt';
+  mod?: 'ctrl' | 'alt' | 'shift';
   action?: 'copy' | 'paste' | 'select';
   /** Force a line break here (mobile only): the keys after it wrap to a new row. */
   rowBreak?: boolean;
@@ -2808,6 +2837,7 @@ const KEYS: KeyDef[] = [
   { label: 'Tab', seq: '\t' },
   { label: 'Ctrl', mod: 'ctrl' },
   { label: 'Alt', mod: 'alt' },
+  { label: 'Shift', mod: 'shift' },
   { label: '^C', seq: '\x03' },
   { label: 'Enter', seq: '\r' },
   // Touch text-selection toggle: while armed, drag on the terminal to select and
@@ -2825,12 +2855,17 @@ const KEYS: KeyDef[] = [
 
 let ctrlArmed = false;
 let altArmed = false;
-const modButtons: Partial<Record<'ctrl' | 'alt', HTMLElement>> = {};
+let shiftArmed = false;
+const modButtons: Partial<Record<'ctrl' | 'alt' | 'shift', HTMLElement>> = {};
 let selectBtn: HTMLElement | null = null;
 
 function refreshModVisuals(): void {
   modButtons.ctrl?.classList.toggle('armed', ctrlArmed);
   modButtons.alt?.classList.toggle('armed', altArmed);
+  modButtons.shift?.classList.toggle('armed', shiftArmed);
+  for (const button of Object.values(modButtons)) {
+    button?.setAttribute('aria-pressed', String(button.classList.contains('armed')));
+  }
 }
 
 function applyMods(seq: string): string {
@@ -2851,6 +2886,12 @@ function applyMods(seq: string): string {
   return seq;
 }
 
+let stopArrowRepeat: (() => void) | null = null;
+window.addEventListener('blur', () => stopArrowRepeat?.());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopArrowRepeat?.();
+});
+
 for (const def of KEYS) {
   if (def.rowBreak) {
     const brk = document.createElement('div');
@@ -2863,10 +2904,21 @@ for (const def of KEYS) {
   b.type = 'button';
   b.textContent = def.label ?? '';
   b.title = def.label ?? '';
-  if (def.mod) modButtons[def.mod] = b;
+  if (def.mod) {
+    modButtons[def.mod] = b;
+    b.setAttribute('aria-pressed', 'false');
+  }
+  if (def.mod === 'shift') b.title = 'Uppercase the next typed letter';
+  const arrow = def.seq !== undefined && /^\x1b\[[ABCD]$/.test(def.seq);
+  if (arrow) {
+    b.style.touchAction = 'none';
+    b.title = `${def.label} — hold to repeat`;
+  }
+  b.addEventListener('contextmenu', (e) => e.preventDefault());
   if (def.action === 'select') selectBtn = b;
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
+    stopArrowRepeat?.();
     // On touch, never refocus the terminal: focusing its textarea pops up the
     // soft keyboard. The keys send their bytes straight over the WebSocket, so
     // focus isn't needed — preventDefault already keeps whatever focus state
@@ -2900,11 +2952,40 @@ for (const def of KEYS) {
     }
     if (def.mod) {
       if (def.mod === 'ctrl') ctrlArmed = !ctrlArmed;
-      else altArmed = !altArmed;
+      else if (def.mod === 'alt') altArmed = !altArmed;
+      else shiftArmed = !shiftArmed;
       refreshModVisuals();
       return;
     }
-    if (def.seq !== undefined) activeSession?.sendSeq(applyMods(def.seq));
+    const target = activeSession;
+    const seq = def.seq !== undefined ? applyMods(def.seq) : undefined;
+    if (seq !== undefined) target?.sendSeq(seq);
+    if (arrow && target && seq !== undefined) {
+      // Send the same arrow while held, preserving Ctrl/Alt from the initial
+      // press. Shift is independent and never modifies these arrow sequences.
+      let timer: number | null = null;
+      const stop = (): void => {
+        if (timer !== null) window.clearTimeout(timer);
+        timer = null;
+        b.removeEventListener('pointerup', stop);
+        b.removeEventListener('pointercancel', stop);
+        b.removeEventListener('lostpointercapture', stop);
+        if (stopArrowRepeat === stop) stopArrowRepeat = null;
+      };
+      const repeat = (): void => {
+        if (document.hidden || activeSession !== target || !isKeybarVisible() || !target.repeatSeq(seq)) {
+          stop();
+          return;
+        }
+        timer = window.setTimeout(repeat, 50);
+      };
+      stopArrowRepeat = stop;
+      b.addEventListener('pointerup', stop);
+      b.addEventListener('pointercancel', stop);
+      b.addEventListener('lostpointercapture', stop);
+      b.setPointerCapture(e.pointerId);
+      timer = window.setTimeout(repeat, 350);
+    }
     if (ctrlArmed || altArmed) {
       ctrlArmed = false;
       altArmed = false;

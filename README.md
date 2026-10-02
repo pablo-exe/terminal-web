@@ -206,6 +206,23 @@ stop the script (Ctrl-C).
 
 ---
 
+## On-screen keys and the mobile keyboard
+
+Hold an arrow button to repeat it: repetition starts after 350 ms and sends
+one arrow every 50 ms until released. Repetition stops when the page loses
+focus, the tab is hidden, the terminal session changes, or the connection drops.
+Repeated arrows are not queued for reconnection. Ctrl/Alt modifiers still apply
+to the arrow selected when the hold begins.
+
+Shift is an independent toggle that uppercases the next typed ASCII letter;
+tap it again to cancel. It does not add Shift to arrow sequences. Terminal
+protocols do not send a standalone Shift press.
+
+On iOS, opening the software keyboard pans the terminal only enough to expose
+the active cursor. A prompt near the top stays in place; a cursor lower down is
+brought above the on-screen keys. This also follows Safari's visual viewport
+pan without changing the terminal grid merely because the keyboard opened.
+
 ## Input regression checks
 
 ```bash
