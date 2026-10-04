@@ -12,7 +12,6 @@ const MIN_DELAY = 500;
 const MAX_DELAY = 5000;
 const MIN_FONT = 8;
 const MAX_FONT = 28;
-const KEYBAR_HEIGHT = 48; // px when shown
 
 // Floor on the size we will ever report to the server. xterm's FitAddon happily
 // proposes 2x1 whenever the pane momentarily has no layout box (a fullscreen
@@ -834,7 +833,7 @@ class Session {
         if (!active && this.reattachAfterCompose) {
           this.reattachAfterCompose = false;
           this.resync();
-          if (isActive(this)) this.term.focus();
+          this.restoreInputFocus();
         }
       });
     }
@@ -936,7 +935,7 @@ class Session {
         if (this.reattachAfterCompose) {
           this.reattachAfterCompose = false;
           this.resync();
-          if (isActive(this)) this.term.focus();
+          this.restoreInputFocus();
         }
       });
       // The direct-insert half of the IME path. The custom key handler stops
@@ -1401,6 +1400,14 @@ class Session {
     });
   }
 
+  private restoreInputFocus(): void {
+    // Reconnection must not open the device keyboard while the user is using
+    // only the virtual keys. Preserve an existing mobile input focus.
+    if (isActive(this) && !TOUCH_DEVICE) {
+      this.term.focus();
+    }
+  }
+
   focus(): void {
     this.term.focus();
   }
@@ -1509,7 +1516,7 @@ class Session {
         this.reattachAfterCompose = true;
       } else {
         this.resync();
-        if (isActive(this)) this.term.focus();
+        this.restoreInputFocus();
       }
     };
 
@@ -2410,18 +2417,15 @@ function setPaneDims(cols: number, rows: number): void {
   }, BG_RESIZE_DELAY);
 }
 
-// Below this width the key bar wraps to several rows (see styles.css) instead
-// of being one horizontally-scrollable row, so its height is no longer fixed.
+// The mobile breakpoint also switches the top navigation controls.
 const mobileMQ = window.matchMedia('(max-width: 640px)');
 
-// Publish the key bar's real height into --keybar-h so the terminal sits right
-// above it: a fixed value on desktop (single row), the measured wrapped height
-// on a phone.
+// Measure the bar at every width: tablets also use the compact touch grid.
 function updateKeybarHeight(): void {
   if (keybarEl.classList.contains('hidden')) {
     root.style.setProperty('--keybar-h', '0px');
   } else {
-    const h = mobileMQ.matches ? keybarEl.offsetHeight : KEYBAR_HEIGHT;
+    const h = keybarEl.offsetHeight;
     root.style.setProperty('--keybar-h', `${h}px`);
   }
   // The terminal's height is measured from the key bar, and is set in JS now
@@ -2434,7 +2438,14 @@ function isKeybarVisible(): boolean {
 }
 
 function setKeybarVisible(visible: boolean): void {
+  const previousH = isKeybarVisible() ? keybarEl.offsetHeight : 0;
   keybarEl.classList.toggle('hidden', !visible);
+  const nextH = visible ? keybarEl.offsetHeight : 0;
+  // The virtual bar is permanent UI space, not software-keyboard occlusion.
+  // Adjust the resting grid before recalculating a real keyboard's pan.
+  if (restingTermH !== null) {
+    restingTermH = Math.max(0, restingTermH + previousH - nextH);
+  }
   keysBtn.classList.toggle('active', visible);
   refreshMobileUI();
   try {
@@ -2674,7 +2685,6 @@ addBtn.addEventListener('pointerdown', (e) => {
 makeButton(controlsEl, 'tb-btn tb-icon', '☰', 'Sessions', () => openDrawer());
 const keysBtn = makeButton(controlsEl, 'tb-btn tb-icon', '⌨', 'Toggle on-screen keys', () => {
   setKeybarVisible(keybarEl.classList.contains('hidden'));
-  activeSession?.focus();
 });
 makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
   activeSession?.restart();
@@ -2828,28 +2838,22 @@ interface KeyDef {
   seq?: string;
   mod?: 'ctrl' | 'alt' | 'shift';
   action?: 'copy' | 'paste' | 'select';
-  /** Force a line break here (mobile only): the keys after it wrap to a new row. */
-  rowBreak?: boolean;
+  /** Named position in the compact two-row touch grid. */
+  slot: string;
 }
 const KEYS: KeyDef[] = [
-  { label: 'Esc', seq: '\x1b' },
-  { label: 'Tab', seq: '\t' },
-  { label: 'Ctrl', mod: 'ctrl' },
-  { label: 'Alt', mod: 'alt' },
-  { label: 'Shift', mod: 'shift' },
-  { label: '^C', seq: '\x03' },
-  { label: 'Enter', seq: '\r' },
-  // Touch text-selection toggle: while armed, drag on the terminal to select and
-  // lift to copy (a tablet's stand-in for desktop Option-drag selection).
-  { label: 'Select', action: 'select' },
-  // On a phone the arrows get their own second row; everything else stays on the first.
-  { rowBreak: true },
-  // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
-  { label: '^End', seq: '\x1b[1;5F' },
-  { label: '←', seq: '\x1b[D' },
-  { label: '↑', seq: '\x1b[A' },
-  { label: '↓', seq: '\x1b[B' },
-  { label: '→', seq: '\x1b[C' },
+  { label: 'Esc', seq: '\x1b', slot: 'esc' },
+  { label: 'Tab', seq: '\t', slot: 'tab' },
+  { label: 'Ctrl', mod: 'ctrl', slot: 'ctrl' },
+  { label: 'Alt', mod: 'alt', slot: 'alt' },
+  { label: 'Shift', mod: 'shift', slot: 'shift' },
+  { label: '^C', seq: '\x03', slot: 'interrupt' },
+  { label: 'Enter', seq: '\r', slot: 'enter' },
+  { label: 'Select', action: 'select', slot: 'select' },
+  { label: '←', seq: '\x1b[D', slot: 'left' },
+  { label: '↑', seq: '\x1b[A', slot: 'up' },
+  { label: '↓', seq: '\x1b[B', slot: 'down' },
+  { label: '→', seq: '\x1b[C', slot: 'right' },
 ];
 
 let ctrlArmed = false;
@@ -2892,14 +2896,9 @@ document.addEventListener('visibilitychange', () => {
 });
 
 for (const def of KEYS) {
-  if (def.rowBreak) {
-    const brk = document.createElement('div');
-    brk.className = 'kb-break';
-    keybarEl.append(brk);
-    continue;
-  }
   const b = document.createElement('button');
   b.className = 'kb-key';
+  b.style.gridArea = def.slot;
   b.type = 'button';
   b.textContent = def.label ?? '';
   b.title = def.label ?? '';
@@ -2922,7 +2921,7 @@ for (const def of KEYS) {
     // soft keyboard. The keys send their bytes straight over the WebSocket, so
     // focus isn't needed — preventDefault already keeps whatever focus state
     // (and thus the keyboard) the user already had.
-    const refocus = e.pointerType !== 'touch';
+    const refocus = e.pointerType === 'mouse' && !TOUCH_DEVICE;
     if (def.action === 'select') {
       // Toggle touch-select mode. While on, dragging the terminal selects text
       // (and lifting copies it) instead of scrolling; tap again to go back to
@@ -3311,11 +3310,11 @@ refreshMobileUI();
 // Global resize handling
 // ---------------------------------------------------------------------------
 window.addEventListener('resize', () => {
-  updateKeybarHeight(); // rows may re-wrap when the width changes
+  updateKeybarHeight(); // the touch grid may change at the breakpoint
   fitActive();
 });
 // Re-measure when crossing the mobile breakpoint (e.g. rotating the phone),
-// since the key bar switches between a fixed row and the wrapped layout.
+// since the key bar can switch between a desktop row and the touch grid.
 mobileMQ.addEventListener('change', () => {
   updateKeybarHeight();
   fitActive();

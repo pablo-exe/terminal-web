@@ -355,17 +355,25 @@ adds two bars:
   drops it.
   Drag again to redo the selection before committing to it. **Copy the screen**
   in the `⋯` sheet does the select-all and the copy in one tap.
-- **Bottom key bar** — `Copy Paste Esc Tab Ctrl Alt ← ↑ ↓ → Home End PgUp PgDn
-  ^C | ~ / -`, horizontally scrollable. `Ctrl` and `Alt` are **sticky**: tap to
-  arm them (they highlight), then the next key is sent with that modifier — e.g.
-  `Ctrl` then `c` sends `Ctrl-C`; `Ctrl`/`Alt` + an arrow sends the xterm
-  modified sequence.
+- **Bottom key bar** — `Esc Tab Ctrl Alt Shift ^C Enter Select ← ↑ ↓ →`.
+  Phones and touch tablets use a compact two-row grid:
+
+  | Esc | Tab | Ctrl | Alt | ↑ | Enter |
+  | --- | --- | --- | --- | --- | --- |
+  | Shift | ^C | Select | ← | ↓ | → |
+
+  Desktop uses a single horizontally scrollable row. `Ctrl` and `Alt` are
+  sticky: tap to arm them, then the next virtual key consumes the modifier.
+  Ctrl/Alt + an arrow sends the corresponding terminal sequence. Hold an
+  arrow to repeat it; Shift is independent, as described above.
 
 The key bar shows by default on touch devices and is hidden on desktop; your
 choice is remembered (on the server — see [What the server
-remembers](#what-the-server-remembers)). Tapping a key keeps focus on the
-terminal so the soft keyboard stays up, and the bar lifts above the iOS
-keyboard via the `visualViewport` API.
+remembers](#what-the-server-remembers)). Toggling or using virtual keys does not
+focus the terminal or open the device keyboard on touch devices. An already
+open keyboard stays open. The virtual bar reserves its actual height separately
+from software-keyboard occlusion, so showing it alone does not pan content off
+the top. The bar lifts above an open device keyboard via `visualViewport`.
 
 ---
 

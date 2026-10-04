@@ -306,12 +306,12 @@ test('Android viewport: navigation safe area is not added beneath the keyboard',
   await viewport(page, 560);
   const after = await geometry(page);
   const padding = await page.locator('#keybar').evaluate((el) => parseFloat(getComputedStyle(el).paddingBottom));
-  assert.equal(padding, 6);
+  assert.equal(padding, 5);
   assert.ok(Math.abs(after.keybarBottom - 560) < 1);
   assert.equal(after.rows, before.rows);
   await viewport(page, 915);
   await page.waitForTimeout(80);
-  assert.equal(await page.locator('#keybar').evaluate((el) => parseFloat(getComputedStyle(el).paddingBottom)), 30);
+  assert.equal(await page.locator('#keybar').evaluate((el) => parseFloat(getComputedStyle(el).paddingBottom)), 29);
   assert.equal((await geometry(page)).rows, before.rows);
 });
 
@@ -407,3 +407,84 @@ test('Android: 229-only Backspace after paste works with empty IME context', asy
   await page.waitForTimeout(15);
   assert.equal(await sent(page), 'pasted\x7f');
 });
+
+for (const width of [412, 768]) {
+  test(`Touch keys: toggling and using the bar at ${width}px never focuses the native keyboard`, async (t) => {
+    const page = await fixture(t, android, {});
+    await page.setViewportSize({ width, height: 915 });
+    await page.evaluate(() => {
+      document.activeElement.blur();
+      window.nativeFocusCalls = 0;
+      const original = HTMLTextAreaElement.prototype.focus;
+      HTMLTextAreaElement.prototype.focus = function (...args) {
+        if (this.classList.contains('xterm-helper-textarea')) window.nativeFocusCalls++;
+        return original.apply(this, args);
+      };
+    });
+    const toggle = page.locator(width > 640 ? '#topbar [title="Toggle on-screen keys"]' : '#mobilebar [title="Toggle on-screen keys"]');
+    await toggle.tap();
+    await toggle.tap();
+    await page.locator('#keybar button').filter({ hasText: /^Tab$/ }).tap();
+    await page.locator('#keybar button').filter({ hasText: /^←$/ }).tap();
+    await page.waitForTimeout(100);
+    assert.equal(await sent(page), '\t\x1b[D');
+    assert.equal(await page.evaluate(() => window.nativeFocusCalls), 0);
+    assert.equal(await page.evaluate(() => document.activeElement.classList.contains('xterm-helper-textarea')), false);
+    // A socket reconnect while only virtual keys are in use must not refocus.
+    await page.evaluate(() => window.fixtureSockets[0].close());
+    await page.waitForFunction(() => window.fixtureSockets[1]?.readyState === 1);
+    assert.equal(await page.evaluate(() => window.nativeFocusCalls), 0);
+  });
+}
+
+test('Touch keys: two rows fit narrow phones and tablets with Up above Down', async (t) => {
+  const page = await fixture(t);
+  for (const width of [320, 360, 412, 768]) {
+    await page.setViewportSize({ width, height: 915 });
+    await page.waitForTimeout(80);
+    const layout = await page.locator('#keybar').evaluate((bar) => {
+      const box = bar.getBoundingClientRect();
+      const keys = [...bar.querySelectorAll('button')].map((b) => {
+        const r = b.getBoundingClientRect();
+        return { label: b.textContent, x: r.x, y: r.y, right: r.right, bottom: r.bottom,
+          width: r.width, textFits: b.scrollWidth <= b.clientWidth };
+      });
+      return { height: box.height, left: box.left, right: box.right, bottom: box.bottom, keys };
+    });
+    assert.equal(new Set(layout.keys.map((key) => key.y)).size, 2, JSON.stringify(layout));
+    assert.equal(layout.keys.some((key) => key.label.includes('End')), false);
+    assert.ok(layout.height <= 96, JSON.stringify(layout));
+    const up = layout.keys.find((key) => key.label === '↑');
+    const down = layout.keys.find((key) => key.label === '↓');
+    const select = layout.keys.find((key) => key.label === 'Select');
+    assert.equal(up.x, down.x);
+    assert.equal(up.width, down.width);
+    assert.ok(up.y < down.y);
+    assert.equal(select.y, down.y);
+    for (const key of layout.keys) {
+      assert.ok(key.x >= layout.left && key.right <= layout.right && key.bottom <= layout.bottom, JSON.stringify(key));
+      assert.ok(key.textFits, JSON.stringify(key));
+    }
+  }
+});
+
+for (const userAgent of [android, ios]) {
+  test(`Virtual bar height: ${userAgent === ios ? 'iOS' : 'Android'} reserves space without hiding the top`, async (t) => {
+    const page = await fixture(t, userAgent, {});
+    const toggle = page.locator('#mobilebar [title="Toggle on-screen keys"]');
+    await toggle.tap(); // hide the default visible bar, keeping textarea focus
+    await page.waitForTimeout(80);
+    await output(page, '\x1b[2J\x1b[HTOP\x1b[999;1H$ ');
+    await toggle.tap();
+    await page.waitForTimeout(150);
+    const after = await geometry(page);
+    assert.equal(after.pan, 0, JSON.stringify(after));
+    const area = await page.locator('#terminal').evaluate((el) => {
+      const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom };
+    });
+    assert.ok(area.top >= after.headerBottom, JSON.stringify({ area, after }));
+    assert.ok(Math.abs(area.bottom - after.keybarTop) < 1, JSON.stringify({ area, after }));
+    assert.equal(await page.locator('#keybar').evaluate((el) => el.offsetHeight),
+      await page.evaluate(() => parseFloat(document.documentElement.style.getPropertyValue('--keybar-h'))));
+  });
+}
