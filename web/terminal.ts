@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { AndroidInput } from './androidInput.js';
 
 // ---------------------------------------------------------------------------
 // Constants & helpers
@@ -413,6 +414,7 @@ class Session {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
+  private androidInput: AndroidInput | null = null;
   // Until when a connect may create this session if it is not there. The
   // server refuses to bring back a closed tab for a connect that does not ask
   // (see closedTabs in server.ts) — only a tab made on purpose asks, and only
@@ -527,8 +529,8 @@ class Session {
     // belonging to a composition shuts both off. e.isComposing is per-event, so
     // it cannot latch on if a compositionend is ever missed.
     this.term.attachCustomKeyEventHandler((e) => {
-      // Gboard delivers printable input through keyCode 229 plus textarea
-      // mutations. Let xterm observe those keys and the resulting input events.
+      // AndroidInput intercepts Gboard events in ancestor capture before xterm.
+      // Desktop/iOS retain the existing composition handling below.
       if (!isAndroid && e.type === 'keydown' && (e.isComposing || e.keyCode === 229)) {
         return false; // composition keystroke — ours, not xterm's
       }
@@ -823,23 +825,17 @@ class Session {
     }
 
     if (ta && isAndroid) {
-      // xterm owns Android IME input. In particular, Gboard can emit 229 +
-      // insertText without compositionend, so our commit-only path would drop
-      // every character. Do not clear its textarea or filter its onData here.
-      // Still track composition to postpone reconnect-induced focus changes.
-      ta.addEventListener('compositionstart', () => {
-        this.composing = true;
-      });
-      ta.addEventListener('compositionend', () => {
-        this.composing = false;
-        // xterm finalizes asynchronously. Its listener was registered first;
-        // allow that pending commit to run before resizing/refocusing.
-        window.setTimeout(() => {
-          if (this.composing || !this.reattachAfterCompose) return;
+      this.androidInput = new AndroidInput(this.term, (data) => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+        this.sendTyped(data);
+        return true;
+      }, (active) => {
+        this.composing = active;
+        if (!active && this.reattachAfterCompose) {
           this.reattachAfterCompose = false;
           this.resync();
           if (isActive(this)) this.term.focus();
-        }, 0);
+        }
       });
     }
 
@@ -1025,6 +1021,7 @@ class Session {
 
   /** Repeated keys are never queued during a disconnected socket. */
   repeatSeq(seq: string): boolean {
+    this.androidInput?.reset();
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     this.send(seq);
     return true;
@@ -1044,6 +1041,7 @@ class Session {
    * silently dropped by send() and leave the path un-pasted.
    */
   sendSeq(seq: string): void {
+    this.androidInput?.reset();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.send(seq);
       return;
@@ -1565,6 +1563,7 @@ class Session {
   }
 
   dispose(): void {
+    this.androidInput?.dispose();
     this.disposed = true;
     this.mate?.dispose(); // the pair goes together, or the second one is orphaned
     this.mate = null;

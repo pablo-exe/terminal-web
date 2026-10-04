@@ -223,6 +223,17 @@ the active cursor. A prompt near the top stays in place; a cursor lower down is
 brought above the on-screen keys. This also follows Safari's visual viewport
 pan without changing the terminal grid merely because the keyboard opened.
 
+## Android predictive text
+
+Gboard can edit a word or replace an entire phrase in the hidden textarea.
+Android input translates the difference from the last committed text into
+cursor movement, deletion and insertion. Unchanged text is not sent again,
+and changing a word without changing its length is still an edit.
+Composition stays visible until committed. Enter and other terminal keys commit
+pending text before clearing the local keyboard context. Paste and on-screen
+keys also clear that context so a later correction cannot delete their content.
+Hardware keyboard shortcuts, iOS and desktop retain xterm's existing handling.
+
 ## Input regression checks
 
 ```bash
@@ -234,7 +245,8 @@ npm run test:input
 These checks load the real frontend and xterm.js in headless Chromium with
 fixture HTTP responses and a recording WebSocket. They do not start the server,
 a shell, or tmux. They cover Android's keyCode 229 + input events, predictive
-composition, repeated Unicode input, paste, Backspace, reconnection during
+composition, in-place Gboard corrections, phrase deletion, repeated Unicode input,
+paste, Backspace, reconnection during
 composition, and the custom iOS and desktop input paths. Android viewport checks
 also cover a fresh prompt, a cursor near the bottom, browser viewport panning,
 layout/visual viewport differences, and navigation safe-area padding through

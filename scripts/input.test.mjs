@@ -314,3 +314,96 @@ test('Android viewport: navigation safe area is not added beneath the keyboard',
   assert.equal(await page.locator('#keybar').evaluate((el) => parseFloat(getComputedStyle(el).paddingBottom)), 30);
   assert.equal((await geometry(page)).rows, before.rows);
 });
+
+// Model a single-line editor receiving real terminal bytes, including cursor
+// movement. This checks the resulting phrase, not the chosen diff algorithm.
+function editedLine(bytes) {
+  const line = [];
+  let caret = 0;
+  for (let i = 0; i < bytes.length;) {
+    const arrow = /^(?:\x1b\[|\x1bO)([CD])/.exec(bytes.slice(i));
+    if (arrow) {
+      caret = Math.max(0, Math.min(line.length, caret + (arrow[1] === 'C' ? 1 : -1)));
+      i += arrow[0].length;
+    } else {
+      const char = String.fromCodePoint(bytes.codePointAt(i));
+      i += char.length;
+      if (char === '\x7f') {
+        if (caret) line.splice(--caret, 1);
+      } else if (char === '\r') {
+        line.length = 0;
+        caret = 0;
+      } else {
+        line.splice(caret++, 0, char);
+      }
+    }
+  }
+  return line.join('');
+}
+async function gboardEdit(page, value, inputType = 'insertReplacementText') {
+  await page.evaluate(({ value, inputType }) => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Unidentified', keyCode: 229, bubbles: true }));
+    ta.dispatchEvent(new InputEvent('beforeinput', { data: value, inputType, bubbles: true }));
+    ta.value = value;
+    ta.dispatchEvent(new InputEvent('input', { data: value, inputType, bubbles: true, composed: true }));
+  }, { value, inputType });
+  await page.waitForTimeout(15);
+}
+
+test('Android: equal-length Gboard correction and subsequent input do not replay the phrase', async (t) => {
+  const page = await fixture(t);
+  await gboardText(page, 'echo tset');
+  await gboardEdit(page, 'echo test');
+  assert.equal(editedLine(await sent(page)), 'echo test');
+  await gboardText(page, 'ing');
+  assert.equal(editedLine(await sent(page)), 'echo testing');
+  await gboardEdit(page, 'echo tested');
+  await gboardText(page, '!');
+  assert.equal(editedLine(await sent(page)), 'echo tested!');
+});
+
+test('Android: Gboard phrase deletion and a longer correction preserve the unchanged prefix', async (t) => {
+  const page = await fixture(t);
+  await gboardText(page, 'echo corregir esta frase');
+  await gboardEdit(page, 'echo corregir', 'deleteWordBackward');
+  assert.equal(editedLine(await sent(page)), 'echo corregir');
+  await gboardEdit(page, 'echo corregir bien');
+  await gboardText(page, ' ahora');
+  assert.equal(editedLine(await sent(page)), 'echo corregir bien ahora');
+});
+
+test('Android: composition replaces an existing word once and commits before Enter', async (t) => {
+  const page = await fixture(t);
+  await gboardText(page, 'echo tset');
+  await page.evaluate(() => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    ta.setSelectionRange(5, 9);
+    ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    ta.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'test', bubbles: true }));
+    ta.value = 'echo test';
+    ta.dispatchEvent(new InputEvent('input', { data: 'test', inputType: 'insertCompositionText', isComposing: true, bubbles: true }));
+  });
+  assert.equal(await sent(page), 'echo tset');
+  await commit(page, 'test');
+  assert.equal(editedLine(await sent(page)), 'echo test');
+  const corrected = await sent(page);
+  await page.keyboard.press('Enter');
+  assert.equal(await sent(page), corrected + '\r');
+  await gboardText(page, 'echo next');
+  assert.equal(editedLine(await sent(page)), 'echo next');
+});
+
+test('Android: 229-only Backspace after paste works with empty IME context', async (t) => {
+  const page = await fixture(t);
+  await page.evaluate(() => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    const clipboardData = new DataTransfer();
+    clipboardData.setData('text/plain', 'pasted');
+    ta.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+    ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Unidentified', keyCode: 229, bubbles: true }));
+    ta.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
+  });
+  await page.waitForTimeout(15);
+  assert.equal(await sent(page), 'pasted\x7f');
+});
