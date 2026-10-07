@@ -371,7 +371,11 @@ The key bar shows by default on touch devices and is hidden on desktop; your
 choice is remembered (on the server — see [What the server
 remembers](#what-the-server-remembers)). Toggling or using virtual keys does not
 focus the terminal or open the device keyboard on touch devices. An already
-open keyboard stays open. The virtual bar reserves its actual height separately
+open keyboard stays open. If the keyboard is closed but the browser retained
+textarea focus (for example, Android Back), virtual-key gestures set that input
+to readonly with inputmode=none and blur it. Tapping the terminal restores normal
+input; selection-mode gestures leave the guard in place. The virtual bar
+reserves its actual height separately
 from software-keyboard occlusion, so showing it alone does not pan content off
 the top. The bar lifts above an open device keyboard via `visualViewport`.
 

@@ -414,6 +414,9 @@ class Session {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
   private androidInput: AndroidInput | null = null;
+  private virtualKeysOnly = false;
+  private savedInputMode = '';
+  private savedReadOnly = false;
   // Until when a connect may create this session if it is not there. The
   // server refuses to bring back a closed tab for a connect that does not ask
   // (see closedTabs in server.ts) — only a tab made on purpose asks, and only
@@ -582,7 +585,11 @@ class Session {
     // With two terminals on screen, something has to say which one the key bar,
     // a paste and an uploaded file are meant for. Touching one is that
     // something — the same gesture that focuses it for typing.
-    this.el.addEventListener('pointerdown', () => focusPane(this), { capture: true });
+    this.el.addEventListener('pointerdown', (event) => {
+      const handle = (event.target as HTMLElement | null)?.closest('.sel-handle');
+      if (!touchSelectMode && !handle) this.restoreDeviceInput();
+      focusPane(this);
+    }, { capture: true });
     this.term.textarea?.addEventListener('focus', () => focusPane(this));
 
     this.wireInput();
@@ -1398,6 +1405,28 @@ class Session {
       // is laid out, so fit() has the real size to hand the server.
       this.start();
     });
+  }
+
+  prepareVirtualKeys(): void {
+    const ta = this.term.textarea;
+    if (!ta || this.virtualKeysOnly || nativeKeyboardVisible()) return;
+    this.savedInputMode = ta.inputMode;
+    this.savedReadOnly = ta.readOnly;
+    this.virtualKeysOnly = true;
+    // Android Back may hide Gboard without blurring this editable textarea.
+    // Prevent a later user gesture/default focus from reopening that keyboard.
+    // readonly is also a fallback for browsers that ignore inputmode=none.
+    ta.inputMode = 'none';
+    ta.readOnly = true;
+    ta.blur();
+  }
+
+  private restoreDeviceInput(): void {
+    const ta = this.term.textarea;
+    if (!ta || !this.virtualKeysOnly) return;
+    ta.inputMode = this.savedInputMode;
+    ta.readOnly = this.savedReadOnly;
+    this.virtualKeysOnly = false;
   }
 
   private restoreInputFocus(): void {
@@ -2616,6 +2645,16 @@ function updateKeyboardOffset(): void {
   // through the ResizeObserver on #terminal.
 }
 
+function nativeKeyboardVisible(): boolean {
+  if (root.classList.contains('keyboard-open')) return true;
+  const hiddenBelow = Math.max(0, window.innerHeight - visibleBottom(), framedCovered);
+  const available = Math.max(0, window.innerHeight - hiddenBelow -
+    cssPx(root, '--keybar-h') - cssPx(termArea, 'top'));
+  // Also cover browsers that shrink their layout viewport instead of just
+  // visualViewport. The resting height excludes the virtual bar's own space.
+  return Math.max(hiddenBelow, (restingTermH ?? available) - available) > KEYBOARD_MIN_PX;
+}
+
 // ---------------------------------------------------------------------------
 // Top-bar controls + on-screen key bar
 // ---------------------------------------------------------------------------
@@ -3048,6 +3087,20 @@ const mKeysBtn = mBtn('⌨', 'Toggle on-screen keys', () => {
   // which defeats the point of toggling the on-screen keys.
   setKeybarVisible(keybarEl.classList.contains('hidden'));
 });
+// Guard the actual editable element, including compatibility touch/mouse
+// events. Virtual keys remain usable with a keyboard already visible.
+const prepareVirtualGesture = (event: Event): void => {
+  if (!TOUCH_DEVICE && !isAndroid && !isIOS &&
+      (!(event instanceof PointerEvent) || event.pointerType === 'mouse')) return;
+  updateKeyboardOffset();
+  activeSession?.prepareVirtualKeys();
+};
+for (const element of [keybarEl, keysBtn, mKeysBtn]) {
+  for (const type of ['pointerdown', 'touchstart', 'mousedown']) {
+    element.addEventListener(type, prepareVirtualGesture, { capture: true });
+  }
+}
+
 const mMoreBtn = mBtn('⋯', 'More actions', () => openSheet());
 
 mobilebar.append(mMenuBtn, mTitle, mAttachBtn, mKeysBtn, mMoreBtn);

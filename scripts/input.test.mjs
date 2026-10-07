@@ -488,3 +488,41 @@ for (const userAgent of [android, ios]) {
       await page.evaluate(() => parseFloat(document.documentElement.style.getPropertyValue('--keybar-h'))));
   });
 }
+
+for (const userAgent of [android, ios]) {
+  test(`Virtual keys: ${userAgent === ios ? 'iOS' : 'Android'} keyboard dismissed while textarea remains focused`, async (t) => {
+    const page = await fixture(t, userAgent, {});
+    // Android Back hides the OS keyboard but keeps DOM focus. Do not blur the
+    // textarea as the earlier independence checks did.
+    assert.equal(await page.locator('.xterm-helper-textarea').evaluate((ta) => ta === document.activeElement), true);
+    await page.locator('#keybar button').filter({ hasText: /^Tab$/ }).tap();
+    assert.deepEqual(await page.locator('.xterm-helper-textarea').evaluate((ta) => ({
+      mode: ta.inputMode, readonly: ta.readOnly, focused: ta === document.activeElement,
+    })), { mode: 'none', readonly: true, focused: false });
+    await page.locator('#keybar button').filter({ hasText: /^←$/ }).tap();
+    assert.equal(await sent(page), '\t\x1b[D');
+    // Even a later browser/default focus cannot target an editable input.
+    await page.locator('.xterm-helper-textarea').focus();
+    assert.equal(await page.locator('.xterm-helper-textarea').evaluate((ta) => ta.readOnly), true);
+    await page.locator('#terminal').tap({ position: { x: 30, y: 30 } });
+    assert.deepEqual(await page.locator('.xterm-helper-textarea').evaluate((ta) => ({
+      mode: ta.inputMode, readonly: ta.readOnly,
+    })), { mode: '', readonly: false });
+    await page.locator('.xterm-helper-textarea').focus();
+    if (userAgent === android) await gboardText(page, 'ok');
+    else await page.keyboard.type('ok');
+    assert.equal(await sent(page), '\t\x1b[Dok');
+  });
+
+  test(`Virtual keys: ${userAgent === ios ? 'iOS' : 'Android'} keeps an already open device keyboard editable`, async (t) => {
+    const page = await fixture(t, userAgent, {});
+    await viewport(page, 560);
+    await page.locator('#keybar button').filter({ hasText: /^Tab$/ }).tap();
+    assert.deepEqual(await page.locator('.xterm-helper-textarea').evaluate((ta) => ({
+      readonly: ta.readOnly, focused: ta === document.activeElement,
+    })), { readonly: false, focused: true });
+    if (userAgent === android) await gboardText(page, 'a');
+    else await page.keyboard.type('a');
+    assert.equal(await sent(page), '\ta');
+  });
+}
